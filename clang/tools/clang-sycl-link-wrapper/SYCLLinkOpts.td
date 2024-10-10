@@ -1,6 +1,3 @@
-// We try to create options similar to lld's.  That way, options passed to clang
-// -Xoffload-linker can be the same whether offloading to nvptx or amdgpu.
-
 include "llvm/Option/OptParser.td"
 
 def WrapperOnlyOption : OptionFlag;
@@ -37,14 +34,14 @@ def save_temps : Flag<["--", "-"], "save-temps">,
 def dry_run : Flag<["--", "-"], "dry-run">, Flags<[WrapperOnlyOption]>,
   HelpText<"Print generated commands without running.">;
 
-def sycl_dump_device_code_EQ : Joined<["--", "-"], "sycl-dump-device-code=">,
+def spirv_dump_device_code_EQ : Joined<["--", "-"], "spirv-dump-device-code=">,
   Flags<[WrapperOnlyOption]>,
   HelpText<"Path to the folder where the tool dumps SPIR-V device code. Other formats aren't dumped.">;
 
 def sycl_is_windows_msvc_env : Flag<["--", "-"], "sycl-is-windows-msvc-env">,
   Flags<[WrapperOnlyOption, HelpHidden]>;
 
-// Special option to pass in llvm-spirv options
+// Options to pass to llvm-spirv tool
 def llvm_spirv_options_EQ : Joined<["--", "-"], "llvm-spirv-options=">,
   Flags<[WrapperOnlyOption]>,
   HelpText<"Options that will control llvm-spirv step">;

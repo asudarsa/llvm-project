@@ -53,7 +53,7 @@ using namespace llvm;
 using namespace llvm::opt;
 using namespace llvm::object;
 
-/// Ssave intermediary results.
+/// Save intermediary results.
 static bool SaveTemps = false;
 
 /// Print arguments without executing.
@@ -66,7 +66,7 @@ static bool Verbose = false;
 static StringRef OutputFile;
 
 /// Directory to dump SPIR-V IR if requested by user.
-SmallString<128> SPIRVDumpDir;
+static SmallString<128> SPIRVDumpDir;
 
 static void printVersion(raw_ostream &OS) {
   OS << clang::getClangToolFullVersion("clang-sycl-link-wrapper") << '\n';
@@ -427,9 +427,8 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
           formatv("failed to create dump directory. path: {0}, error_code: {1}",
                   SPIRVDumpDir, EC.value()));
 
-    StringRef Sep = llvm::sys::path::get_separator();
     StringRef Path = OutputFile;
-    StringRef Filename = Path.rsplit(Sep).second;
+    StringRef Filename = llvm::sys::path::filename(Path);
     SmallString<128> CopyPath = SPIRVDumpDir;
     CopyPath.append(Filename);
     EC = llvm::sys::fs::copy_file(Path, CopyPath);
@@ -501,8 +500,8 @@ int main(int argc, char **argv) {
   if (Args.hasArg(OPT_o))
     OutputFile = Args.getLastArgValue(OPT_o);
 
-  if (Args.hasArg(OPT_sycl_dump_device_code_EQ)) {
-    Arg *A = Args.getLastArg(OPT_sycl_dump_device_code_EQ);
+  if (Args.hasArg(OPT_spirv_dump_device_code_EQ)) {
+    Arg *A = Args.getLastArg(OPT_spirv_dump_device_code_EQ);
     SmallString<128> Dir(A->getValue());
     if (Dir.empty())
       llvm::sys::path::native(Dir = "./");

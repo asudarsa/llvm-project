@@ -1,6 +1,6 @@
-====================
-Clang SYCL link Wrapper
-====================
+=======================
+Clang SYCL Link Wrapper
+=======================
 
 .. contents::
    :local:
@@ -11,57 +11,70 @@ Introduction
 ============
 
 This tool works as a wrapper around the SYCL device code linking process.
-Purpose of this wrapper is to provide an interface to link SYCL device bitcode
-in LLVM IR format, run some SYCL-specific finalization steps and then use the
-SPIR-V LLVM Translator tool to produce the final output.
+The purpose of this wrapper is to provide an interface to link SYCL device
+bitcode in LLVM IR format, SYCL device bitcode in SPIR-V IR format, and native
+binary objects, and then use the SPIR-V LLVM Translator tool on fully linked
+device objects to produce the final output.
+After the linking stage, the fully linked device code in LLVM IR format may
+undergo several SYCL-specific finalization steps before the SPIR-V code
+generation step.
+The wrapper will also support the Ahead-Of-Time compilation flow. AOT
+compilation is the process of invoking the back-end at compile time to produce
+the final binary, as opposed to just-in-time (JIT) compilation when final code
+generation is deferred until application runtime time.
 
-Device code linking for SYCL offloading kind has a number of known quirks that
+Device code linking for SYCL offloading has several known quirks that
 makes it difficult to use in a unified offloading setting. Two of the primary
 issues are:
-1. Several finalization steps are required to be run on the fully-linked LLVM
-IR bitcode to gaurantee conformance to SYCL standards. This step is unique to
-SYCL offloading compilation flow.
-2. SPIR-V LLVM Translator tool is an extenal tool and hence SPIR-V IR code
-generation cannot be done as part of LTO. This limitation will be lifted once
-SPIR-V backend is available as a viable LLVM backend.
+1. Several finalization steps are required to be run on the fully linked LLVM
+IR bitcode to guarantee conformance to SYCL standards. This step is unique to
+the SYCL offloading compilation flow.
+2. The SPIR-V LLVM Translator tool is an external tool and hence SPIR-V IR code
+generation cannot be done as part of LTO. This limitation can be lifted once
+the SPIR-V backend is available as a viable LLVM backend.
 
-This tool works around these issues.
+This tool has been proposed to work around these issues.
 
 Usage
 =====
 
 This tool can be used with the following options. Several of these options will
-be passed down to downstrea tools like 'llvm-link', 'llvm-spirv', etc.
+be passed down to downstream tools like 'llvm-link', 'llvm-spirv', etc.
 
 .. code-block:: console
 
-  OVERVIEW: A utility that wraps around the SYCl device code linking process.
-  This enables linking and code generation for SPIR-V JIT targets.
+  OVERVIEW: A utility that wraps around the SYCL device code linking process.
+  This enables linking and code generation for SPIR-V JIT targets and AOT
+  targets.
 
   USAGE: clang-sycl-link-wrapper [options]
 
   OPTIONS:
-    --arch <value>       Specify the name of the target architecture.
-    --dry-run            Print generated commands without running.
-    -g                   Specify that this was a debug compile.
-    -help-hidden         Display all available options
-    -help                Display available options (--help-hidden for more)
-    --library-path=<dir> Set the library path for SYCL device libraries
-    -o <path>            Path to file to write output
-    --save-temps         Save intermediate results
-    --triple <value>     Specify the target triple.
-    --version            Display the version number and exit
-    -v                   Print verbose information
+    --arch <value>                Specify the name of the target architecture.
+    --dry-run                     Print generated commands without running.
+    -g                            Specify that this was a debug compile.
+    -help-hidden                  Display all available options
+    -help                         Display available options (--help-hidden for more)
+    --library-path=<dir>          Set the library path for SYCL device libraries
+    -o <path>                     Path to file to write output
+    --save-temps                  Save intermediate results
+    --triple <value>              Specify the target triple.
+    --version                     Display the version number and exit
+    -v                            Print verbose information
+    -spirv-dump-device-code=<dir> Directory to dump SPIR-V IR code into
+    -sycl-is-windows-msvc-env     Specify if we are compiling under windows environment
+    -llvm-spirv-options=<value>   Pass options to llvm-spirv tool
 
 Example
 =======
 
 This tool is intended to be invoked when targeting the SPIR-V toolchain.
-When --sycl-link option is passed, clang driver will invoke the linking job of
-the SPIR-V toolchain, which in turn will invoke this tool.
-This tool can be used to create one or more fully linked SYCL objects that are
-ready to be wrapped and linked with host code to generate the final executable.
+When the --sycl-link option is passed to the clang driver, the driver will
+invoke the linking job of the SPIR-V toolchain, which in turn will invoke this
+tool. This tool can be used to create one or more fully linked device images
+that are ready to be wrapped and linked with host code to generate the final
+executable.
 
 .. code-block:: console
 
-  clang --target=spirv64 --sycl-link input.bc
+  clang-sycl-link-wrapper --triple spirv64 --arch native input.bc
