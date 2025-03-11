@@ -16,6 +16,7 @@
 
 #include "clang/Basic/Version.h"
 
+#include "../../llvm/lib/Target/SPIRV/SPIRVAPI.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -304,121 +305,61 @@ static Expected<StringRef> linkDeviceLibFiles(StringRef InputFile,
   return *OutFileOrErr;
 }
 
-/// Add any llvm-spirv option that relies on a specific Triple in addition
-/// to user supplied options.
-static void getSPIRVTransOpts(const ArgList &Args,
-                              SmallVector<StringRef, 8> &TranslatorArgs,
-                              const llvm::Triple Triple) {
-  // Enable NonSemanticShaderDebugInfo.200 for non-Windows
-  const bool IsWindowsMSVC =
-      Triple.isWindowsMSVCEnvironment() || Args.hasArg(OPT_is_windows_msvc_env);
-  const bool EnableNonSemanticDebug = !IsWindowsMSVC;
-  if (EnableNonSemanticDebug) {
-    TranslatorArgs.push_back(
-        "-spirv-debug-info-version=nonsemantic-shader-200");
-  } else {
-    TranslatorArgs.push_back("-spirv-debug-info-version=ocl-100");
-    // Prevent crash in the translator if input IR contains DIExpression
-    // operations which don't have mapping to OpenCL.DebugInfo.100 spec.
-    TranslatorArgs.push_back("-spirv-allow-extra-diexpressions");
-  }
-  std::string UnknownIntrinsics("-spirv-allow-unknown-intrinsics=llvm.genx.");
-
-  TranslatorArgs.push_back(Args.MakeArgString(UnknownIntrinsics));
-
-  // Disable all the extensions by default
-  std::string ExtArg("-spirv-ext=-all");
-  std::string DefaultExtArg =
-      ",+SPV_EXT_shader_atomic_float_add,+SPV_EXT_shader_atomic_float_min_max"
-      ",+SPV_KHR_no_integer_wrap_decoration,+SPV_KHR_float_controls"
-      ",+SPV_KHR_expect_assume,+SPV_KHR_linkonce_odr";
-  std::string INTELExtArg =
-      ",+SPV_INTEL_subgroups,+SPV_INTEL_media_block_io"
-      ",+SPV_INTEL_device_side_avc_motion_estimation"
-      ",+SPV_INTEL_fpga_loop_controls,+SPV_INTEL_unstructured_loop_controls"
-      ",+SPV_INTEL_fpga_reg,+SPV_INTEL_blocking_pipes"
-      ",+SPV_INTEL_function_pointers,+SPV_INTEL_kernel_attributes"
-      ",+SPV_INTEL_io_pipes,+SPV_INTEL_inline_assembly"
-      ",+SPV_INTEL_arbitrary_precision_integers"
-      ",+SPV_INTEL_float_controls2,+SPV_INTEL_vector_compute"
-      ",+SPV_INTEL_fast_composite"
-      ",+SPV_INTEL_arbitrary_precision_fixed_point"
-      ",+SPV_INTEL_arbitrary_precision_floating_point"
-      ",+SPV_INTEL_variable_length_array,+SPV_INTEL_fp_fast_math_mode"
-      ",+SPV_INTEL_long_constant_composite"
-      ",+SPV_INTEL_arithmetic_fence"
-      ",+SPV_INTEL_global_variable_decorations"
-      ",+SPV_INTEL_cache_controls"
-      ",+SPV_INTEL_fpga_buffer_location"
-      ",+SPV_INTEL_fpga_argument_interfaces"
-      ",+SPV_INTEL_fpga_invocation_pipelining_attributes"
-      ",+SPV_INTEL_fpga_latency_control"
-      ",+SPV_INTEL_task_sequence"
-      ",+SPV_KHR_shader_clock"
-      ",+SPV_INTEL_bindless_images";
-  ExtArg = ExtArg + DefaultExtArg + INTELExtArg;
-  ExtArg += ",+SPV_INTEL_token_type"
-            ",+SPV_INTEL_bfloat16_conversion"
-            ",+SPV_INTEL_joint_matrix"
-            ",+SPV_INTEL_hw_thread_queries"
-            ",+SPV_KHR_uniform_group_instructions"
-            ",+SPV_INTEL_masked_gather_scatter"
-            ",+SPV_INTEL_tensor_float32_conversion"
-            ",+SPV_INTEL_optnone"
-            ",+SPV_KHR_non_semantic_info"
-            ",+SPV_KHR_cooperative_matrix";
-  TranslatorArgs.push_back(Args.MakeArgString(ExtArg));
-}
-
 /// Run LLVM to SPIR-V translation.
-/// Converts 'File' from LLVM bitcode to SPIR-V format using llvm-spirv tool.
+/// Converts 'File' from LLVM bitcode to SPIR-V format using SPIR-V backend,
 /// 'Args' encompasses all arguments required for linking device code and will
-/// be parsed to generate options required to be passed into llvm-spirv tool.
-static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
-                                                     const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("LLVMToSPIRVTranslation");
-  StringRef LLVMSPIRVPath = Args.getLastArgValue(OPT_llvm_spirv_path_EQ);
-  Expected<std::string> LLVMToSPIRVProg =
-      findProgram(Args, "llvm-spirv", {LLVMSPIRVPath});
-  if (!LLVMToSPIRVProg)
-    return LLVMToSPIRVProg.takeError();
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*LLVMToSPIRVProg);
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
-  getSPIRVTransOpts(Args, CmdArgs, Triple);
-  StringRef LLVMToSPIRVOptions;
-  if (Arg *A = Args.getLastArg(OPT_llvm_spirv_options_EQ))
-    LLVMToSPIRVOptions = A->getValue();
-  LLVMToSPIRVOptions.split(CmdArgs, " ", /* MaxSplit = */ -1,
-                           /* KeepEmpty = */ false);
-  CmdArgs.append({"-o", OutputFile});
-  CmdArgs.push_back(File);
-  if (Error Err = executeCommands(*LLVMToSPIRVProg, CmdArgs))
-    return std::move(Err);
-
-  if (!SPIRVDumpDir.empty()) {
-    std::error_code EC =
-        llvm::sys::fs::create_directory(SPIRVDumpDir, /*IgnoreExisting*/ true);
-    if (EC)
-      return createStringError(
-          EC,
-          formatv("failed to create dump directory. path: {0}, error_code: {1}",
-                  SPIRVDumpDir, EC.value()));
-
-    StringRef Path = OutputFile;
-    StringRef Filename = llvm::sys::path::filename(Path);
-    SmallString<128> CopyPath = SPIRVDumpDir;
-    CopyPath.append(Filename);
-    EC = llvm::sys::fs::copy_file(Path, CopyPath);
-    if (EC)
-      return createStringError(
-          EC,
-          formatv(
-              "failed to copy file. original: {0}, copy: {1}, error_code: {2}",
-              Path, CopyPath, EC.value()));
+/// be parsed to generate options required to be passed into the backend.
+static Expected<StringRef> runLLVMSPIRVBackend(StringRef File,
+                                               const ArgList &Args) {
+  llvm::TimeTraceScope TimeScope("LLVMToSPIRVTranslationViaSPIRVBackend");
+  std::vector<std::string> ExtNames, Opts;
+  if (Verbose || DryRun) {
+    errs() << formatv("LLVM-SPIRV-Backend: input: {0}, output: {1}\n", File,
+                      OutputFile);
+    if (DryRun)
+      return OutputFile;
   }
 
+  SMDiagnostic Err;
+  LLVMContext C;
+  std::unique_ptr<Module> M = parseIRFile(File, Err, C);
+  if (!M)
+    return createStringError(inconvertibleErrorCode(), Err.getMessage());
+
+  static const std::string DefaultTriple = "spirv64v1.6-unknown-unknown";
+
+  // Correct the Triple value if needed
+  // TODO: Remove this correction once we start using spirv64/spirv32 triples
+  // everywhere.
+  Triple TargetTriple(M->getTargetTriple());
+  if (TargetTriple.isSPIR()) {
+    TargetTriple.setArch(TargetTriple.getArch() == Triple::spir64
+                             ? Triple::spirv64
+                             : Triple::spirv32,
+                         TargetTriple.getSubArch());
+    M->setTargetTriple(TargetTriple);
+    // We need to reset Data Layout to conform with the TargetMachine
+    M->setDataLayout("");
+  }
+  if (TargetTriple.getTriple().empty())
+    TargetTriple.setTriple(DefaultTriple);
+  TargetTriple.setArch(TargetTriple.getArch(), Triple::SPIRVSubArch_v16);
+  M->setTargetTriple(TargetTriple);
+
+  int FD = -1;
+  if (std::error_code EC = sys::fs::openFileForWrite(OutputFile, FD))
+    return errorCodeToError(EC);
+  auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
+
+  std::string Result, ErrMsg;
+  // List of allowed extensions. Currently, all extensions are allowed.
+  // TODO: Update list of allowed extensions for SYCL compilation flow.
+  static const std::vector<std::string> AllowExtNames{"all"};
+  // Translate the Module into SPIR-V
+  if (!SPIRVTranslateModule(M.release(), Result, ErrMsg, AllowExtNames, {}))
+    return createStringError(
+        "SPIRVTranslation: SPIRV translation failed with " + ErrMsg);
+  *OS << Result;
   return OutputFile;
 }
 
@@ -435,7 +376,7 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
     reportError(DeviceLinkedFile.takeError());
 
   // LLVM to SPIR-V translation step
-  auto SPVFile = runLLVMToSPIRVTranslation(*DeviceLinkedFile, Args);
+  auto SPVFile = runLLVMSPIRVBackend(*DeviceLinkedFile, Args);
   if (!SPVFile)
     return SPVFile.takeError();
   return Error::success();
