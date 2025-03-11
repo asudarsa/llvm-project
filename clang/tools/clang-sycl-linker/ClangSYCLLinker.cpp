@@ -306,7 +306,7 @@ static Expected<StringRef> linkDeviceLibFiles(StringRef InputFile,
 }
 
 /// Run LLVM to SPIR-V translation.
-/// Converts 'File' from LLVM bitcode to SPIR-V format using SPIR-V backend,
+/// Converts 'File' from LLVM bitcode to SPIR-V format using SPIR-V backend.
 /// 'Args' encompasses all arguments required for linking device code and will
 /// be parsed to generate options required to be passed into the backend.
 static Expected<StringRef> runLLVMSPIRVBackend(StringRef File,
