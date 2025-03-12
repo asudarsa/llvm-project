@@ -16,7 +16,6 @@
 
 #include "clang/Basic/Version.h"
 
-#include "../../llvm/lib/Target/SPIRV/SPIRVAPI.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -24,6 +23,7 @@
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/LTO/LTO.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/ArchiveWriter.h"
 #include "llvm/Object/Binary.h"
@@ -47,6 +47,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/WithColor.h"
+#include "llvm/Target/TargetMachine.h"
 
 using namespace llvm;
 using namespace llvm::opt;
@@ -78,6 +79,17 @@ static const char *Executable;
 static SmallVector<SmallString<128>> TempFiles;
 
 namespace {
+
+std::once_flag InitOnceFlag;
+void InitializeSPIRVTarget() {
+  std::call_once(InitOnceFlag, []() {
+    LLVMInitializeSPIRVTargetInfo();
+    LLVMInitializeSPIRVTarget();
+    LLVMInitializeSPIRVTargetMC();
+    LLVMInitializeSPIRVAsmPrinter();
+  });
+}
+
 // Must not overlap with llvm::opt::DriverFlag.
 enum LinkerFlags { LinkerOnlyOption = (1 << 4) };
 
@@ -319,6 +331,9 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
       return OutputFile;
   }
 
+  // SPIR-V-specific target initialization.
+  InitializeSPIRVTarget();
+
   SMDiagnostic Err;
   LLVMContext C;
   std::unique_ptr<Module> M = parseIRFile(File, Err, C);
@@ -345,20 +360,32 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   TargetTriple.setArch(TargetTriple.getArch(), Triple::SPIRVSubArch_v16);
   M->setTargetTriple(TargetTriple);
 
+  std::string Msg;
+  const Target *T = TargetRegistry::lookupTarget(M->getTargetTriple(), Msg);
+  if (!T)
+    return createStringError(Msg + ": " + M->getTargetTriple().str());
+
+  TargetOptions Options;
+  std::optional<Reloc::Model> RM;
+  std::optional<CodeModel::Model> CM;
+  std::unique_ptr<TargetMachine> TM(
+      T->createTargetMachine(M->getTargetTriple().str(), "", "", Options, RM,
+                             CM));
+  if (!TM)
+    return createStringError("Could not allocate target machine!");
+
   int FD = -1;
   if (std::error_code EC = sys::fs::openFileForWrite(OutputFile, FD))
     return errorCodeToError(EC);
   auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
 
-  std::string Result, ErrMsg;
-  // List of allowed extensions. Currently, all extensions are allowed.
-  // TODO: Update list of allowed extensions for SYCL compilation flow.
-  static const std::vector<std::string> AllowExtNames{"all"};
-  // Translate the Module into SPIR-V
-  if (!SPIRVTranslateModule(M.release(), Result, ErrMsg, AllowExtNames, {}))
-    return createStringError(
-        "SPIRVTranslation: SPIRV translation failed with " + ErrMsg);
-  *OS << Result;
+  legacy::PassManager CodeGenPasses;
+  TargetLibraryInfoImpl TLII(M->getTargetTriple());
+  CodeGenPasses.add(new TargetLibraryInfoWrapperPass(TLII));
+  if (TM->addPassesToEmitFile(CodeGenPasses, *OS, nullptr,
+                              CodeGenFileType::ObjectFile))
+    return createStringError("Failed to execute SPIR-V backend");
+  CodeGenPasses.run(*M);
   return OutputFile;
 }
 
