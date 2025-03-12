@@ -341,24 +341,12 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
     return createStringError(inconvertibleErrorCode(), Err.getMessage());
 
   static const std::string DefaultTriple = "spirv64v1.6-unknown-unknown";
-
-  // Correct the Triple value if needed
-  // TODO: Remove this correction once we start using spirv64/spirv32 triples
-  // everywhere.
   Triple TargetTriple(M->getTargetTriple());
-  if (TargetTriple.isSPIR()) {
-    TargetTriple.setArch(TargetTriple.getArch() == Triple::spir64
-                             ? Triple::spirv64
-                             : Triple::spirv32,
-                         TargetTriple.getSubArch());
-    M->setTargetTriple(TargetTriple);
-    // We need to reset Data Layout to conform with the TargetMachine
-    M->setDataLayout("");
-  }
   if (TargetTriple.getTriple().empty())
     TargetTriple.setTriple(DefaultTriple);
   TargetTriple.setArch(TargetTriple.getArch(), Triple::SPIRVSubArch_v16);
   M->setTargetTriple(TargetTriple);
+  assert(TargetTriple.isSPIROrSPIRV() && "Target triple is not SPIR or SPIR-V");
 
   std::string Msg;
   const Target *T = TargetRegistry::lookupTarget(M->getTargetTriple(), Msg);
@@ -372,6 +360,9 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
       M->getTargetTriple().str(), "", "", Options, RM, CM));
   if (!TM)
     return createStringError("Could not allocate target machine!");
+
+  if (M->getDataLayout().isDefault())
+    M->setDataLayout(TM->createDataLayout());
 
   int FD = -1;
   if (std::error_code EC = sys::fs::openFileForWrite(OutputFile, FD))
