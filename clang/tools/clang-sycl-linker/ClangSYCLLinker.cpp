@@ -368,9 +368,8 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   TargetOptions Options;
   std::optional<Reloc::Model> RM;
   std::optional<CodeModel::Model> CM;
-  std::unique_ptr<TargetMachine> TM(
-      T->createTargetMachine(M->getTargetTriple().str(), "", "", Options, RM,
-                             CM));
+  std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
+      M->getTargetTriple().str(), "", "", Options, RM, CM));
   if (!TM)
     return createStringError("Could not allocate target machine!");
 
