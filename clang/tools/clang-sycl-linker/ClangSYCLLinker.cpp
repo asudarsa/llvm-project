@@ -207,7 +207,7 @@ Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
 /// be parsed to generate options required to be passed into llvm-link.
 Expected<StringRef> linkDeviceInputFiles(ArrayRef<std::string> InputFiles,
                                          const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("SYCL LinkDeviceInputFiles");
+  llvm::TimeTraceScope TimeScope("Link device input files");
 
   assert(InputFiles.size() && "No inputs to llvm-link");
   // Early check to see if there is only one input.
@@ -272,7 +272,7 @@ Expected<SmallVector<std::string>> getSYCLDeviceLibs(const ArgList &Args) {
 /// be parsed to generate options required to be passed into llvm-link tool.
 static Expected<StringRef> linkDeviceLibFiles(StringRef InputFile,
                                               const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("LinkDeviceLibraryFiles");
+  llvm::TimeTraceScope TimeScope("Link device library files");
 
   auto SYCLDeviceLibFiles = getSYCLDeviceLibs(Args);
   if (!SYCLDeviceLibFiles)
@@ -309,10 +309,9 @@ static Expected<StringRef> linkDeviceLibFiles(StringRef InputFile,
 /// Converts 'File' from LLVM bitcode to SPIR-V format using SPIR-V backend.
 /// 'Args' encompasses all arguments required for linking device code and will
 /// be parsed to generate options required to be passed into the backend.
-static Expected<StringRef> runLLVMSPIRVBackend(StringRef File,
-                                               const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("LLVMToSPIRVTranslationViaSPIRVBackend");
-  std::vector<std::string> ExtNames, Opts;
+static Expected<StringRef> runSPIRVCodeGen(StringRef File,
+                                           const ArgList &Args) {
+  llvm::TimeTraceScope TimeScope("SPIR-V code generation");
   if (Verbose || DryRun) {
     errs() << formatv("LLVM-SPIRV-Backend: input: {0}, output: {1}\n", File,
                       OutputFile);
@@ -364,7 +363,7 @@ static Expected<StringRef> runLLVMSPIRVBackend(StringRef File,
 }
 
 Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
+  llvm::TimeTraceScope TimeScope("SYCL device linking");
   // First llvm-link step
   auto LinkedFile = linkDeviceInputFiles(Files, Args);
   if (!LinkedFile)
@@ -375,8 +374,8 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   if (!DeviceLinkedFile)
     reportError(DeviceLinkedFile.takeError());
 
-  // LLVM to SPIR-V translation step
-  auto SPVFile = runLLVMSPIRVBackend(*DeviceLinkedFile, Args);
+  // SPIR-V code generation step
+  auto SPVFile = runSPIRVCodeGen(*DeviceLinkedFile, Args);
   if (!SPVFile)
     return SPVFile.takeError();
   return Error::success();
