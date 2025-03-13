@@ -325,7 +325,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
                                            const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SPIR-V code generation");
   if (Verbose || DryRun) {
-    errs() << formatv("LLVM-SPIRV-Backend: input: {0}, output: {1}\n", File,
+    errs() << formatv("SPIR-V Backend: input: {0}, output: {1}\n", File,
                       OutputFile);
     if (DryRun)
       return OutputFile;
@@ -340,7 +340,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   if (!M)
     return createStringError(inconvertibleErrorCode(), Err.getMessage());
 
-  static const std::string DefaultTriple = "spirv64v1.6-unknown-unknown";
+  static const std::string DefaultTriple = "spirv64-unknown-unknown";
   Triple TargetTriple(M->getTargetTriple());
   if (TargetTriple.getTriple().empty())
     TargetTriple.setTriple(DefaultTriple);
@@ -356,8 +356,9 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   TargetOptions Options;
   std::optional<Reloc::Model> RM;
   std::optional<CodeModel::Model> CM;
-  std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
-      M->getTargetTriple().str(), "", "", Options, RM, CM));
+  std::unique_ptr<TargetMachine> TM(
+      T->createTargetMachine(M->getTargetTriple().str(), /* CPU */ "",
+                             /* Features */ "", Options, RM, CM));
   if (!TM)
     return createStringError("Could not allocate target machine!");
 
@@ -374,7 +375,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   CodeGenPasses.add(new TargetLibraryInfoWrapperPass(TLII));
   if (TM->addPassesToEmitFile(CodeGenPasses, *OS, nullptr,
                               CodeGenFileType::ObjectFile))
-    return createStringError("Failed to execute SPIR-V backend");
+    return createStringError("Failed to execute SPIR-V Backend");
   CodeGenPasses.run(*M);
   return OutputFile;
 }
