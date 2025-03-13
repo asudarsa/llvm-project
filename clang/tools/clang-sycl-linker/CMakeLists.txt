@@ -1,8 +1,10 @@
 set(LLVM_LINK_COMPONENTS
   ${LLVM_TARGETS_TO_BUILD}
   BinaryFormat
+  MC
   Option
   Object
+  Target
   TargetParser
   Support
   )
