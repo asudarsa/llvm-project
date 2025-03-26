@@ -235,6 +235,8 @@ getBitcodeInputs(SmallVector<std::string> &Filenames) {
     for (auto &OffloadFile : Binaries) {
       if (ContainsBitcode(OffloadFile))
         BitcodeFiles.emplace_back(std::move(OffloadFile));
+      else
+        return createStringError("Unsupported file type");
     }
   }
   return BitcodeFiles;
@@ -544,6 +546,7 @@ int main(int Argc, char **Argv) {
   auto FilesOrErr = getBitcodeInputs(*FilenamesOrErr);
   if (!FilesOrErr)
     reportError(FilesOrErr.takeError());
+
   // Run SYCL linking process on the generated inputs.
   if (Error Err = runSYCLLink(*FilesOrErr, Args))
     reportError(std::move(Err));
