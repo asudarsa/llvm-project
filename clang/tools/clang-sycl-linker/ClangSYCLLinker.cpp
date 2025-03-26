@@ -69,9 +69,6 @@ static StringRef OutputFile;
 /// Directory to dump SPIR-V IR if requested by user.
 static SmallString<128> SPIRVDumpDir;
 
-/// Mutex lock to protect writes to shared TempFiles in parallel.
-static std::mutex TempFilesMutex;
-
 static void printVersion(raw_ostream &OS) {
   OS << clang::getClangToolFullVersion("clang-sycl-linker") << '\n';
 }
@@ -191,16 +188,15 @@ DerivedArgList getLinkerArgs(ArrayRef<OffloadFile> Input,
   DerivedArgList DAL = DerivedArgList(DerivedArgList(Args));
   for (Arg *A : Args)
     DAL.append(A);
+  if (DryRun)
+    return DAL;
 
   // Set the subarchitecture and target triple for this compilation.
   const OptTable &Tbl = getOptTable();
-  if (!DryRun) {
-    DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_arch),
-                     Args.MakeArgString(Input.front().getBinary()->getArch()));
-    DAL.AddJoinedArg(
-        nullptr, Tbl.getOption(OPT_triple),
-        Args.MakeArgString(Input.front().getBinary()->getTriple()));
-  }
+  DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_arch),
+                   Args.MakeArgString(Input.front().getBinary()->getArch()));
+  DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_triple),
+                   Args.MakeArgString(Input.front().getBinary()->getTriple()));
 
   return DAL;
 }
@@ -472,19 +468,15 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
   return OutputFile;
 }
 
-Error runSYCLLink(ArrayRef<OffloadFile> Files, const ArgList &Args, char **Argv,
-                  int Argc) {
+Error runSYCLLink(ArrayRef<OffloadFile> Files, const InputArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
-  // Update Args List for the SPIR-V device
-  const OptTable &Tbl = getOptTable();
-  BumpPtrAllocator Alloc;
-  StringSaver Saver(Alloc);
+
   LLVMContext C;
-  auto BaseArgs =
-      Tbl.parseArgs(Argc, Argv, OPT_INVALID, Saver,
-                    [](StringRef Err) { reportError(createStringError(Err)); });
-  auto LinkerArgs = getLinkerArgs(Files, BaseArgs);
-  // Linking device code
+
+  // Update args list with triple and arch information for SPIR-V device
+  auto LinkerArgs = getLinkerArgs(Files, Args);
+
+  // Linking device bitcode files
   auto LinkedFileOrErr = linkDeviceCode(Files, LinkerArgs, C);
   if (!LinkedFileOrErr)
     reportError(LinkedFileOrErr.takeError());
@@ -501,12 +493,6 @@ Error runSYCLLink(ArrayRef<OffloadFile> Files, const ArgList &Args, char **Argv,
 
 int main(int Argc, char **Argv) {
   InitLLVM X(Argc, Argv);
-
-  InitializeAllTargetInfos();
-  InitializeAllTargets();
-  InitializeAllTargetMCs();
-  InitializeAllAsmParsers();
-  InitializeAllAsmPrinters();
 
   Executable = Argv[0];
   sys::PrintStackTraceOnErrorSignal(Argv[0]);
@@ -559,7 +545,7 @@ int main(int Argc, char **Argv) {
   if (!FilesOrErr)
     reportError(FilesOrErr.takeError());
   // Run SYCL linking process on the generated inputs.
-  if (Error Err = runSYCLLink(*FilesOrErr, Args, Argv, Argc))
+  if (Error Err = runSYCLLink(*FilesOrErr, Args))
     reportError(std::move(Err));
 
   // Remove the temporary files created.
