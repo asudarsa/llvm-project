@@ -271,8 +271,9 @@ Expected<SmallVector<std::string>> getSYCLDeviceLibs(const ArgList &Args) {
 /// 3. Link all the images gathered in Step 2 with the output of Step 1 using
 /// linkInModule API. LinkOnlyNeeded flag is used.
 Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
-                                   const ArgList &Args, LLVMContext &C) {
+                                   const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCL link device code");
+  LLVMContext C;
 
   assert(InputFiles.size() && "No inputs to link");
 
@@ -381,7 +382,7 @@ static void getSPIRVTransOpts(const ArgList &Args,
       ",+SPV_INTEL_arbitrary_precision_fixed_point"
       ",+SPV_INTEL_arbitrary_precision_floating_point"
       ",+SPV_INTEL_variable_length_array,+SPV_INTEL_fp_fast_math_mode"
-      // ",+SPV_INTEL_long_constant_composite"
+      ",+SPV_INTEL_long_composites"
       ",+SPV_INTEL_arithmetic_fence"
       ",+SPV_INTEL_global_variable_decorations"
       ",+SPV_INTEL_cache_controls"
@@ -460,10 +461,9 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
 
 Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
-  LLVMContext C;
 
   // Link all input bitcode files and SYCL device library files, if any
-  auto LinkedFile = linkDeviceCode(Files, Args, C);
+  auto LinkedFile = linkDeviceCode(Files, Args);
   if (!LinkedFile)
     reportError(LinkedFile.takeError());
 
