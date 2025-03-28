@@ -34,10 +34,3 @@ entry:
 }
 
 attributes #0 = { mustprogress nofree noinline norecurse nosync nounwind willreturn memory(none) "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
-
-!llvm.module.flags = !{!0, !1}
-!llvm.ident = !{!2}
-
-!0 = !{i32 1, !"wchar_size", i32 4}
-!1 = !{i32 7, !"frame-pointer", i32 2}
-!2 = !{!"clang version 21.0.0git (https://github.com/asudarsa/llvm-project.git 596488cdf625d2f2a84c381f0ddc4bc0968f73c0)"}
