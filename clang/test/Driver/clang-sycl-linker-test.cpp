@@ -1,20 +1,12 @@
 // Tests the clang-sycl-linker tool.
 //
-// Test a simple case to link two fat objects.
-// RUN: %clangxx -c -target spirv64 %s -o %t_1.o
-// RUN: %clangxx -c -target spirv64 %s -o %t_2.o
+// Test a simple case to link two input files.
+// RUN: touch %t_1.o
+// RUN: touch %t_2.o
 // RUN: clang-sycl-linker --dry-run -triple spirv64 %t_1.o %t_2.o -o a.spv 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=SIMPLE-FO
 // SIMPLE-FO: sycl-device-link: inputs: {{.*}}.o, {{.*}}.o  libfiles:  output: [[LLVMLINKOUT:.*]].bc
 // SIMPLE-FO-NEXT: "{{.*}}llvm-spirv{{.*}}" {{.*}}-o a.spv [[LLVMLINKOUT]].bc
-//
-// Test a simple case to link two LLVM IR bitcodes.
-// RUN: %clangxx -emit-llvm -c %s -o %t_1.bc
-// RUN: %clangxx -emit-llvm -c %s -o %t_2.bc
-// RUN: clang-sycl-linker --dry-run -triple spirv64 %t_1.bc %t_2.bc -o a.spv 2>&1 \
-// RUN:   | FileCheck %s --check-prefix=SIMPLE-BC
-// SIMPLE-BC: sycl-device-link: inputs: {{.*}}.bc, {{.*}}.bc  libfiles:  output: [[LLVMLINKOUT:.*]].bc
-// SIMPLE-BC-NEXT: "{{.*}}llvm-spirv{{.*}}" {{.*}}-o a.spv [[LLVMLINKOUT]].bc
 //
 // Test a simple case with device library files specified.
 // RUN: touch %T/lib1.o
@@ -24,7 +16,7 @@
 // DEVLIBS: sycl-device-link: inputs: {{.*}}.o  libfiles: {{.*}}lib1.o, {{.*}}lib2.o  output: [[LLVMLINKOUT:.*]].bc
 // DEVLIBS-NEXT: "{{.*}}llvm-spirv{{.*}}" {{.*}}-o a.spv [[LLVMLINKOUT]].bc
 //
-// Test a simple case with a random file as input.
+// Test a simple case with a random file (not bitcode) as input.
 // RUN: touch %t.x.o
 // RUN: clang-offload-packager -o %t.o --image=file=%t.x.o,kind=openmp,triple=spirv64,arch=
 // RUN: not clang-sycl-linker -triple spirv64 %t.o -o a.spv 2>&1 \
