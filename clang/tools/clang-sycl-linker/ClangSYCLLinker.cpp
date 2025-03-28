@@ -192,48 +192,27 @@ Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
     file_magic Magic;
     if (auto EC = identify_magic(*Filename, Magic))
       return createStringError("Failed to open file " + *Filename);
+    // TODO: Current use case involves LLVM IR bitcode files as input.
+    // This will be extended to support SPIR-V IR files.
+    if (Magic != file_magic::bitcode)
+      return createStringError("Unsupported file type");
     BitcodeFiles.push_back(*Filename);
   }
   return BitcodeFiles;
 }
 
+/// Handle cases where input file is a LLVM IR bitcode file
+/// When clang-sycl-linker is called via clang-linker-wrapper tool, input files
+/// are LLVM IR bitcode files
+// TODO: Support SPIR-V IR files
 Expected<std::unique_ptr<Module>> getBitcodeModule(StringRef File,
                                                    LLVMContext &C) {
   SMDiagnostic Err;
 
-  // Handle cases where input file is a LLVM IR bitcode file.
-  // When clang-sycl-linker is called via clang-linker-wrapper tool, input files
-  // are LLVM IR bitcode files
-  // TODO:  Support SPIR-V IR files
   auto M = getLazyIRFileModule(File, Err, C);
   if (M)
     return std::move(M);
-
-  // Handle cases where input file is a fat object containing LLVM IR bitcode
-  // SYCL device libraries are provided as fat objects containing LLVM IR
-  // bitcode
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
-      MemoryBuffer::getFile(File);
-  if (std::error_code EC = BufferOrErr.getError())
-    return createFileError(File, EC);
-  MemoryBufferRef Buffer = **BufferOrErr;
-  SmallVector<OffloadFile> Binaries;
-  if (Error Err = extractOffloadBinaries(Buffer, Binaries))
-    return std::move(Err);
-  // Only one binary of bitcode image type is expected
-  assert((Binaries.size() == 1) && "Only one binary per file is expected");
-  auto Bin = std::move(Binaries.front());
-  // TODO: Current use case involves LLVM IR bitcode files as input.
-  // This will be extended to support objects and SPIR-V IR files.
-  auto TheImage = Bin.getBinary()->getImage();
-  if (identify_magic(TheImage) != file_magic::bitcode)
-    return createStringError("Unsupported file type");
-  // TODO: Try to replace this call with getLazyIRModule
-  M = parseIR(MemoryBufferRef(TheImage, ""), Err, C);
-  if (M)
-    return std::move(M);
-
-  return createStringError("Unsupported file type");
+  return createStringError("Unable to parse file");
 }
 
 // This utility function is used to gather all SYCL device library files that
@@ -289,7 +268,7 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
   if (!SYCLDeviceLibFiles)
     return SYCLDeviceLibFiles.takeError();
 
-  if (DryRun || Verbose) {
+  if (Verbose) {
     std::string Inputs =
         std::accumulate(std::next(InputFiles.begin()), InputFiles.end(),
                         InputFiles.front(), [](std::string a, std::string b) {
@@ -305,8 +284,6 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
     errs() << formatv(
         "sycl-device-link: inputs: {0} libfiles: {1} output: {2}\n", Inputs,
         LibInputs, *BitcodeOutput);
-    if (DryRun)
-      return *BitcodeOutput;
   }
 
   auto LinkerOutput = std::make_unique<Module>("sycl-device-link", C);
@@ -327,11 +304,14 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
     if (!LibMod)
       return LibMod.takeError();
     if ((*LibMod)->getTargetTriple() == Triple) {
-      unsigned Flags = Linker::Flags::None;
+      unsigned Flags = Linker::Flags::LinkOnlyNeeded;
       if (L.linkInModule(std::move(*LibMod), Flags))
         return createStringError("Could not link IR");
     }
   }
+
+  if (Args.hasArg(OPT_print_linked_module))
+    errs() << *LinkerOutput;
 
   // Write the final output into 'BitcodeOutput' file
   int FD = -1;
