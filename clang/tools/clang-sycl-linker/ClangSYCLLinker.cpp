@@ -253,7 +253,6 @@ Expected<SmallVector<std::string>> getSYCLDeviceLibs(const ArgList &Args) {
 Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
                                    const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCL link device code");
-  LLVMContext C;
 
   assert(InputFiles.size() && "No inputs to link");
 
@@ -286,6 +285,7 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
         LibInputs, *BitcodeOutput);
   }
 
+  LLVMContext C;
   auto LinkerOutput = std::make_unique<Module>("sycl-device-link", C);
   Linker L(*LinkerOutput);
   // Link SYCL device input files.
