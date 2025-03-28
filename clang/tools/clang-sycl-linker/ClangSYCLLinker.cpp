@@ -21,8 +21,6 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/IR/DiagnosticPrinter.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Linker/Linker.h"
@@ -182,64 +180,59 @@ Error executeCommands(StringRef ExecutablePath, ArrayRef<StringRef> Args) {
   return Error::success();
 }
 
-/// Returns a new ArgList containg arguments used for the device linking phase.
-DerivedArgList getLinkerArgs(ArrayRef<OffloadFile> Input,
-                             const InputArgList &Args) {
-  DerivedArgList DAL = DerivedArgList(DerivedArgList(Args));
-  for (Arg *A : Args)
-    DAL.append(A);
-  if (DryRun)
-    return DAL;
-
-  // Set the subarchitecture and target triple for this compilation.
-  const OptTable &Tbl = getOptTable();
-  DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_arch),
-                   Args.MakeArgString(Input.front().getBinary()->getArch()));
-  DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_triple),
-                   Args.MakeArgString(Input.front().getBinary()->getTriple()));
-
-  return DAL;
-}
-
-/// Collect all fat objects from user input.
-Expected<SmallVector<std::string>> getObjectsFromArgs(const ArgList &Args) {
+Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
+  // Collect all input bitcode files to be passed to the device linking stage.
   SmallVector<std::string> BitcodeFiles;
   for (const opt::Arg *Arg : Args.filtered(OPT_INPUT)) {
     std::optional<std::string> Filename = std::string(Arg->getValue());
     if (!Filename || !sys::fs::exists(*Filename) ||
         sys::fs::is_directory(*Filename))
       continue;
-    BitcodeFiles.emplace_back(*Filename);
+    file_magic Magic;
+    if (auto EC = identify_magic(*Filename, Magic))
+      return createStringError("Failed to open file " + *Filename);
+    BitcodeFiles.push_back(*Filename);
   }
   return BitcodeFiles;
 }
 
-/// Collect all input bitcode images from a list of fat objects.
-Expected<SmallVector<OffloadFile>>
-getBitcodeInputs(SmallVector<std::string> &Filenames) {
-  // Collect all input bitcode files to be passed to llvm bitcode linking.
-  SmallVector<OffloadFile> BitcodeFiles;
-  for (auto Filename : Filenames) {
-    ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
-        MemoryBuffer::getFile(Filename);
-    if (std::error_code EC = BufferOrErr.getError())
-      return createFileError(Filename, EC);
-    MemoryBufferRef Buffer = **BufferOrErr;
-    SmallVector<OffloadFile> Binaries;
-    if (Error Err = extractOffloadBinaries(Buffer, Binaries))
-      return std::move(Err);
+Expected<std::unique_ptr<Module>> getBitcodeModule(StringRef File,
+                                                   LLVMContext &C) {
+  SMDiagnostic Err;
 
-    auto ContainsBitcode = [](const OffloadFile &F) {
-      return identify_magic(F.getBinary()->getImage()) == file_magic::bitcode;
-    };
-    for (auto &OffloadFile : Binaries) {
-      if (ContainsBitcode(OffloadFile))
-        BitcodeFiles.emplace_back(std::move(OffloadFile));
-      else
-        return createStringError("Unsupported file type");
-    }
-  }
-  return BitcodeFiles;
+  // Handle cases where input file is a LLVM IR bitcode file.
+  // When clang-sycl-linker is called via clang-linker-wrapper tool, input files
+  // are LLVM IR bitcode files
+  // TODO:  Support SPIR-V IR files
+  auto M = getLazyIRFileModule(File, Err, C);
+  if (M)
+    return std::move(M);
+
+  // Handle cases where input file is a fat object containing LLVM IR bitcode
+  // SYCL device libraries are provided as fat objects containing LLVM IR
+  // bitcode
+  ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
+      MemoryBuffer::getFile(File);
+  if (std::error_code EC = BufferOrErr.getError())
+    return createFileError(File, EC);
+  MemoryBufferRef Buffer = **BufferOrErr;
+  SmallVector<OffloadFile> Binaries;
+  if (Error Err = extractOffloadBinaries(Buffer, Binaries))
+    return std::move(Err);
+  // Only one binary of bitcode image type is expected
+  assert((Binaries.size() == 1) && "Only one binary per file is expected");
+  auto Bin = std::move(Binaries.front());
+  // TODO: Current use case involves LLVM IR bitcode files as input.
+  // This will be extended to support objects and SPIR-V IR files.
+  auto TheImage = Bin.getBinary()->getImage();
+  if (identify_magic(TheImage) != file_magic::bitcode)
+    return createStringError("Unsupported file type");
+  // TODO: Try to replace this call with getLazyIRModule
+  M = parseIR(MemoryBufferRef(TheImage, ""), Err, C);
+  if (M)
+    return std::move(M);
+
+  return createStringError("Unsupported file type");
 }
 
 // This utility function is used to gather all SYCL device library files that
@@ -273,83 +266,77 @@ Expected<SmallVector<std::string>> getSYCLDeviceLibs(const ArgList &Args) {
 
 /// Following tasks are performed:
 /// 1. Link all SYCL device bitcode images into one image. Device linking is
-/// performed using the linkModules API.
+/// performed using the linkInModule API.
 /// 2. Gather all SYCL device library bitcode images.
 /// 3. Link all the images gathered in Step 2 with the output of Step 1 using
-/// linkModules API. LinkOnlyNeeded flag is used.
-Expected<StringRef> linkDeviceCode(ArrayRef<OffloadFile> BitcodeInputFiles,
+/// linkInModule API. LinkOnlyNeeded flag is used.
+Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
                                    const ArgList &Args, LLVMContext &C) {
-  llvm::TimeTraceScope TimeScope("SYCL Link Device Code");
-  // Gather SYCL device library files.
-  auto SYCLDeviceLibFilenames = getSYCLDeviceLibs(Args);
-  if (!SYCLDeviceLibFilenames)
-    return SYCLDeviceLibFilenames.takeError();
-  // Create a new file to write the linked device file to.
+  llvm::TimeTraceScope TimeScope("SYCL link device code");
+
+  assert(InputFiles.size() && "No inputs to link");
+
+  // Create a new file to write the linked device file to
   auto BitcodeOutput =
       createTempFile(Args, sys::path::filename(OutputFile), "bc");
   if (!BitcodeOutput)
     return BitcodeOutput.takeError();
-  int FD = -1;
-  if (std::error_code EC = sys::fs::openFileForWrite(*BitcodeOutput, FD))
-    return errorCodeToError(EC);
+
+  // Get all SYCL device library files, if any
+  auto SYCLDeviceLibFiles = getSYCLDeviceLibs(Args);
+  if (!SYCLDeviceLibFiles)
+    return SYCLDeviceLibFiles.takeError();
+
   if (DryRun || Verbose) {
-    std::for_each((*SYCLDeviceLibFilenames).begin(),
-                  (*SYCLDeviceLibFilenames).end(),
-                  [](std::string &Filename) { Filename += "; "; });
-    std::string LibInputs =
-        std::accumulate((*SYCLDeviceLibFilenames).begin(),
-                        (*SYCLDeviceLibFilenames).end(), std::string(""));
-
-    auto FilenamesOrErr = getObjectsFromArgs(Args);
-    if (!FilenamesOrErr)
-      reportError(FilenamesOrErr.takeError());
-    std::for_each((*FilenamesOrErr).begin(), (*FilenamesOrErr).end(),
-                  [](std::string &Filename) { Filename += "; "; });
-    std::string Inputs = std::accumulate(
-        (*FilenamesOrErr).begin(), (*FilenamesOrErr).end(), std::string(""));
-
+    std::string Inputs =
+        std::accumulate(std::next(InputFiles.begin()), InputFiles.end(),
+                        InputFiles.front(), [](std::string a, std::string b) {
+                          return std::move(a) + ", " + std::move(b);
+                        });
+    std::string LibInputs = "";
+    if (!(*SYCLDeviceLibFiles).empty())
+      LibInputs = std::accumulate(
+          std::next((*SYCLDeviceLibFiles).begin()), (*SYCLDeviceLibFiles).end(),
+          (*SYCLDeviceLibFiles).front(), [](std::string a, std::string b) {
+            return std::move(a) + ", " + std::move(b);
+          });
     errs() << formatv(
-        "sycl-device-link: input: {0} libfiles: {1} output: {2}\n", Inputs,
+        "sycl-device-link: inputs: {0} libfiles: {1} output: {2}\n", Inputs,
         LibInputs, *BitcodeOutput);
     if (DryRun)
       return *BitcodeOutput;
   }
-  SMDiagnostic Err;
-  assert(BitcodeInputFiles.size() && "No inputs to link");
-  auto Output = std::make_unique<Module>("sycl-device-link", C);
-  Linker L(*Output);
+
+  auto LinkerOutput = std::make_unique<Module>("sycl-device-link", C);
+  Linker L(*LinkerOutput);
   // Link SYCL device input files.
-  for (auto &File : BitcodeInputFiles) {
-    auto TheImage = File.getBinary()->getImage();
-    std::unique_ptr<Module> ModOrErr =
-        parseIR(MemoryBufferRef(TheImage, ""), Err, C);
-    if (!ModOrErr || verifyModule(*ModOrErr, &errs()))
-      return createStringError("Could not parse IR");
-    if (L.linkInModule(std::move(ModOrErr)))
+  for (auto &File : InputFiles) {
+    auto ModOrErr = getBitcodeModule(File, C);
+    if (!ModOrErr)
+      return ModOrErr.takeError();
+    if (L.linkInModule(std::move(*ModOrErr)))
       return createStringError("Could not link IR");
   }
-  auto SYCLDeviceLibFiles = getBitcodeInputs(*SYCLDeviceLibFilenames);
-  if (!SYCLDeviceLibFiles)
-    return SYCLDeviceLibFiles.takeError();
-  if (!(*SYCLDeviceLibFiles).empty()) {
-    const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
-    // Link in SYCL device library files.
-    for (auto &File : *SYCLDeviceLibFiles) {
-      auto TheImage = File.getBinary()->getImage();
-      std::unique_ptr<Module> M =
-          parseIR(MemoryBufferRef(TheImage, ""), Err, C);
-      if (!M || verifyModule(*M, &errs()))
-        return createStringError("Could not parse IR in SYCL device lib file");
-      if (M->getTargetTriple() == Triple) {
-        unsigned Flags = Linker::Flags::None;
-        Flags |= Linker::Flags::LinkOnlyNeeded;
-        if (L.linkInModule(std::move(M), Flags))
-          return createStringError("Could not link IR");
-      }
+
+  // Link in SYCL device library files.
+  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
+  for (auto &File : *SYCLDeviceLibFiles) {
+    auto LibMod = getBitcodeModule(File, C);
+    if (!LibMod)
+      return LibMod.takeError();
+    if ((*LibMod)->getTargetTriple() == Triple) {
+      unsigned Flags = Linker::Flags::None;
+      if (L.linkInModule(std::move(*LibMod), Flags))
+        return createStringError("Could not link IR");
     }
   }
+
+  // Write the final output into 'BitcodeOutput' file
+  int FD = -1;
+  if (std::error_code EC = sys::fs::openFileForWrite(*BitcodeOutput, FD))
+    return errorCodeToError(EC);
   llvm::raw_fd_ostream OS(FD, true);
-  WriteBitcodeToFile(*Output, OS);
+  WriteBitcodeToFile(*LinkerOutput, OS);
   return *BitcodeOutput;
 }
 
@@ -394,6 +381,7 @@ static void getSPIRVTransOpts(const ArgList &Args,
       ",+SPV_INTEL_arbitrary_precision_fixed_point"
       ",+SPV_INTEL_arbitrary_precision_floating_point"
       ",+SPV_INTEL_variable_length_array,+SPV_INTEL_fp_fast_math_mode"
+      // ",+SPV_INTEL_long_constant_composite"
       ",+SPV_INTEL_arithmetic_fence"
       ",+SPV_INTEL_global_variable_decorations"
       ",+SPV_INTEL_cache_controls"
@@ -470,39 +458,34 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
   return OutputFile;
 }
 
-Error runSYCLLink(ArrayRef<OffloadFile> Files, const InputArgList &Args) {
+Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
-
   LLVMContext C;
 
-  // Update args list with triple and arch information for SPIR-V device
-  auto LinkerArgs = getLinkerArgs(Files, Args);
+  // Link all input bitcode files and SYCL device library files, if any
+  auto LinkedFile = linkDeviceCode(Files, Args, C);
+  if (!LinkedFile)
+    reportError(LinkedFile.takeError());
 
-  // Linking device bitcode files
-  auto LinkedFileOrErr = linkDeviceCode(Files, LinkerArgs, C);
-  if (!LinkedFileOrErr)
-    reportError(LinkedFileOrErr.takeError());
-
-  // LLVM to SPIR-V translation
-  auto SPVFile = runLLVMToSPIRVTranslation(*LinkedFileOrErr, LinkerArgs);
+  // LLVM to SPIR-V translation step
+  auto SPVFile = runLLVMToSPIRVTranslation(*LinkedFile, Args);
   if (!SPVFile)
     return SPVFile.takeError();
-
   return Error::success();
 }
 
 } // namespace
 
-int main(int Argc, char **Argv) {
-  InitLLVM X(Argc, Argv);
+int main(int argc, char **argv) {
+  InitLLVM X(argc, argv);
 
-  Executable = Argv[0];
-  sys::PrintStackTraceOnErrorSignal(Argv[0]);
+  Executable = argv[0];
+  sys::PrintStackTraceOnErrorSignal(argv[0]);
 
   const OptTable &Tbl = getOptTable();
   BumpPtrAllocator Alloc;
   StringSaver Saver(Alloc);
-  auto Args = Tbl.parseArgs(Argc, Argv, OPT_INVALID, Saver, [&](StringRef Err) {
+  auto Args = Tbl.parseArgs(argc, argv, OPT_INVALID, Saver, [&](StringRef Err) {
     reportError(createStringError(inconvertibleErrorCode(), Err));
   });
 
@@ -540,10 +523,7 @@ int main(int Argc, char **Argv) {
   }
 
   // Get the input files to pass to the linking stage.
-  auto FilenamesOrErr = getObjectsFromArgs(Args);
-  if (!FilenamesOrErr)
-    reportError(FilenamesOrErr.takeError());
-  auto FilesOrErr = getBitcodeInputs(*FilenamesOrErr);
+  auto FilesOrErr = getInput(Args);
   if (!FilesOrErr)
     reportError(FilesOrErr.takeError());
 
