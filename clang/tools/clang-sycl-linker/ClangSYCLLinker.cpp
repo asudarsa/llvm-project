@@ -201,10 +201,10 @@ Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
   return BitcodeFiles;
 }
 
-/// Handle cases where input file is a LLVM IR bitcode file
+/// Handle cases where input file is a LLVM IR bitcode file.
 /// When clang-sycl-linker is called via clang-linker-wrapper tool, input files
-/// are LLVM IR bitcode files
-// TODO: Support SPIR-V IR files
+/// are LLVM IR bitcode files.
+// TODO: Support SPIR-V IR files.
 Expected<std::unique_ptr<Module>> getBitcodeModule(StringRef File,
                                                    LLVMContext &C) {
   SMDiagnostic Err;
@@ -215,9 +215,9 @@ Expected<std::unique_ptr<Module>> getBitcodeModule(StringRef File,
   return createStringError("Unable to parse file");
 }
 
-// This utility function is used to gather all SYCL device library files that
-// will be linked with input device files.
-// The list of files and its location are passed from driver.
+/// Gather all SYCL device library files that will be linked with input device
+/// files.
+/// The list of files and its location are passed from driver.
 Expected<SmallVector<std::string>> getSYCLDeviceLibs(const ArgList &Args) {
   SmallVector<std::string> DeviceLibFiles;
   StringRef LibraryPath;
@@ -256,16 +256,52 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
 
   assert(InputFiles.size() && "No inputs to link");
 
-  // Create a new file to write the linked device file to
+  LLVMContext C;
+  auto LinkerOutput = std::make_unique<Module>("sycl-device-link", C);
+  Linker L(*LinkerOutput);
+  // Link SYCL device input files.
+  for (auto &File : InputFiles) {
+    auto ModOrErr = getBitcodeModule(File, C);
+    if (!ModOrErr)
+      return ModOrErr.takeError();
+    if (L.linkInModule(std::move(*ModOrErr)))
+      return createStringError("Could not link IR");
+  }
+
+  // Get all SYCL device library files, if any.
+  auto SYCLDeviceLibFiles = getSYCLDeviceLibs(Args);
+  if (!SYCLDeviceLibFiles)
+    return SYCLDeviceLibFiles.takeError();
+
+  // Link in SYCL device library files.
+  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
+  for (auto &File : *SYCLDeviceLibFiles) {
+    auto LibMod = getBitcodeModule(File, C);
+    if (!LibMod)
+      return LibMod.takeError();
+    if ((*LibMod)->getTargetTriple() == Triple) {
+      unsigned Flags = Linker::Flags::LinkOnlyNeeded;
+      if (L.linkInModule(std::move(*LibMod), Flags))
+        return createStringError("Could not link IR");
+    }
+  }
+
+  // Dump linked output for testing.
+  if (Args.hasArg(OPT_print_linked_module))
+    outs() << *LinkerOutput;
+
+  // Create a new file to write the linked device file to.
   auto BitcodeOutput =
       createTempFile(Args, sys::path::filename(OutputFile), "bc");
   if (!BitcodeOutput)
     return BitcodeOutput.takeError();
 
-  // Get all SYCL device library files, if any
-  auto SYCLDeviceLibFiles = getSYCLDeviceLibs(Args);
-  if (!SYCLDeviceLibFiles)
-    return SYCLDeviceLibFiles.takeError();
+  // Write the final output into 'BitcodeOutput' file.
+  int FD = -1;
+  if (std::error_code EC = sys::fs::openFileForWrite(*BitcodeOutput, FD))
+    return errorCodeToError(EC);
+  llvm::raw_fd_ostream OS(FD, true);
+  WriteBitcodeToFile(*LinkerOutput, OS);
 
   if (Verbose) {
     std::string Inputs =
@@ -285,40 +321,6 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
         LibInputs, *BitcodeOutput);
   }
 
-  LLVMContext C;
-  auto LinkerOutput = std::make_unique<Module>("sycl-device-link", C);
-  Linker L(*LinkerOutput);
-  // Link SYCL device input files.
-  for (auto &File : InputFiles) {
-    auto ModOrErr = getBitcodeModule(File, C);
-    if (!ModOrErr)
-      return ModOrErr.takeError();
-    if (L.linkInModule(std::move(*ModOrErr)))
-      return createStringError("Could not link IR");
-  }
-
-  // Link in SYCL device library files.
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
-  for (auto &File : *SYCLDeviceLibFiles) {
-    auto LibMod = getBitcodeModule(File, C);
-    if (!LibMod)
-      return LibMod.takeError();
-    if ((*LibMod)->getTargetTriple() == Triple) {
-      unsigned Flags = Linker::Flags::LinkOnlyNeeded;
-      if (L.linkInModule(std::move(*LibMod), Flags))
-        return createStringError("Could not link IR");
-    }
-  }
-
-  if (Args.hasArg(OPT_print_linked_module))
-    errs() << *LinkerOutput;
-
-  // Write the final output into 'BitcodeOutput' file
-  int FD = -1;
-  if (std::error_code EC = sys::fs::openFileForWrite(*BitcodeOutput, FD))
-    return errorCodeToError(EC);
-  llvm::raw_fd_ostream OS(FD, true);
-  WriteBitcodeToFile(*LinkerOutput, OS);
   return *BitcodeOutput;
 }
 
@@ -440,10 +442,13 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
   return OutputFile;
 }
 
+/// Performs the following steps:
+/// 1. Link input device code (user code and SYCL device library code).
+/// 2. Run SPIR-V code generation.
 Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
 
-  // Link all input bitcode files and SYCL device library files, if any
+  // Link all input bitcode files and SYCL device library files, if any.
   auto LinkedFile = linkDeviceCode(Files, Args);
   if (!LinkedFile)
     reportError(LinkedFile.takeError());
