@@ -46,6 +46,10 @@ def llvm_spirv_path_EQ : Joined<["--"], "llvm-spirv-path=">,
   Flags<[LinkerOnlyOption]>, MetaVarName<"<dir>">,
   HelpText<"Set the system llvm-spirv path">;
 
+def spirv_version_EQ : Joined<["--"], "spirv-version=">,
+                       Flags<[LinkerOnlyOption]>,
+                       HelpText<"Set SPIR-V version">;
+
 // Options to pass to llvm-spirv tool
 def llvm_spirv_options_EQ : Joined<["--", "-"], "llvm-spirv-options=">,
   Flags<[LinkerOnlyOption]>,
