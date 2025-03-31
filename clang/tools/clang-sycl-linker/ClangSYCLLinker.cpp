@@ -274,7 +274,7 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
     return SYCLDeviceLibFiles.takeError();
 
   // Link in SYCL device library files.
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
+  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
   for (auto &File : *SYCLDeviceLibFiles) {
     auto LibMod = getBitcodeModule(File, C);
     if (!LibMod)
@@ -405,7 +405,7 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
 
   SmallVector<StringRef, 8> CmdArgs;
   CmdArgs.push_back(*LLVMToSPIRVProg);
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple));
+  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
   getSPIRVTransOpts(Args, CmdArgs, Triple);
   StringRef LLVMToSPIRVOptions;
   if (Arg *A = Args.getLastArg(OPT_llvm_spirv_options_EQ))
