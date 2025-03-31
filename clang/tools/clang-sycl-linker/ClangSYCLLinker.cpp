@@ -335,27 +335,13 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   if (!M)
     return createStringError(inconvertibleErrorCode(), Err.getMessage());
 
-  // Update target triple for SPIR-V backend by incorporating SPIR-V version.
-  StringRef Version = Args.getLastArgValue(OPT_spirv_version_EQ);
-  static const std::string TargetTripleStr =
-      StringSwitch<std::string>(Version)
-          .Case("1.0", "spirv64v1.0-unknown-unknown")
-          .Case("1.1", "spirv64v1.1-unknown-unknown")
-          .Case("1.2", "spirv64v1.2-unknown-unknown")
-          .Case("1.3", "spirv64v1.3-unknown-unknown")
-          .Case("1.4", "spirv64v1.4-unknown-unknown")
-          .Case("1.5", "spirv64v1.5-unknown-unknown")
-          .Case("1.6", "spirv64v1.6-unknown-unknown")
-          .Default("spirv64-unknown-unknown");
-  M->setTargetTriple(llvm::Triple(TargetTripleStr));
-
   // Get a handle to SPIR-V target backend.
   std::string Msg;
   const Target *T = TargetRegistry::lookupTarget(M->getTargetTriple(), Msg);
   if (!T)
     return createStringError(Msg + ": " + M->getTargetTriple().str());
 
-  // Allocate SPIR-V target machine
+  // Allocate SPIR-V target machine.
   TargetOptions Options;
   std::optional<Reloc::Model> RM;
   std::optional<CodeModel::Model> CM;
@@ -375,7 +361,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
     return errorCodeToError(EC);
   auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
 
-  // Run SPIR-V codegen passes to generate SPIR-V file
+  // Run SPIR-V codegen passes to generate SPIR-V file.
   legacy::PassManager CodeGenPasses;
   TargetLibraryInfoImpl TLII(M->getTargetTriple());
   CodeGenPasses.add(new TargetLibraryInfoWrapperPass(TLII));
