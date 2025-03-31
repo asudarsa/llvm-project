@@ -335,6 +335,9 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   if (!M)
     return createStringError(inconvertibleErrorCode(), Err.getMessage());
 
+  Triple TargetTriple(Args.getLastArgValue(OPT_triple_EQ));
+  M->setTargetTriple(TargetTriple);
+
   // Get a handle to SPIR-V target backend.
   std::string Msg;
   const Target *T = TargetRegistry::lookupTarget(M->getTargetTriple(), Msg);
@@ -346,7 +349,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File,
   std::optional<Reloc::Model> RM;
   std::optional<CodeModel::Model> CM;
   std::unique_ptr<TargetMachine> TM(
-      T->createTargetMachine(M->getTargetTriple().str(), /* CPU */ "",
+      T->createTargetMachine(M->getTargetTriple().getTriple(), /* CPU */ "",
                              /* Features */ "", Options, RM, CM));
   if (!TM)
     return createStringError("Could not allocate target machine!");

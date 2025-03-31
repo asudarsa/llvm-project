@@ -24,10 +24,14 @@ def device_libs_EQ : CommaJoined<["--", "-"], "device-libs=">,
   Flags<[LinkerOnlyOption]>,
   HelpText<"A comma separated list of device libraries that are linked during the device link.">;
 
-def triple : Separate<["--", "-"], "triple">,
-  HelpText<"The device target triple">;
-def arch : Separate<["--", "-"], "arch">,
-  HelpText<"Specify the name of the target architecture.">;
+def arch_EQ : Joined<["--", "-"], "arch=">,
+              Flags<[LinkerOnlyOption]>,
+              MetaVarName<"<arch>">,
+              HelpText<"The device subarchitecture">;
+def triple_EQ : Joined<["--", "-"], "triple=">,
+                Flags<[LinkerOnlyOption]>,
+                MetaVarName<"<triple>">,
+                HelpText<"The device target triple">;
 
 def save_temps : Flag<["--", "-"], "save-temps">,
   Flags<[LinkerOnlyOption]>, HelpText<"Save intermediate results">;
