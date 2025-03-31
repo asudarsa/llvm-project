@@ -1,8 +1,8 @@
 // Tests the clang-sycl-linker tool.
 //
 // Test the dry run of a simple case to link two input files.
-// RUN: touch %t_1.bc
-// RUN: touch %t_2.bc
+// RUN: %clangxx -emit-llvm -c %s -o %t_1.bc
+// RUN: %clangxx -emit-llvm -c %s -o %t_2.bc
 // RUN: clang-sycl-linker --dry-run -v -triple spirv64 %t_1.bc %t_2.bc -o a.spv 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=SIMPLE-FO
 // SIMPLE-FO: sycl-device-link: inputs: {{.*}}.bc, {{.*}}.bc  libfiles:  output: [[LLVMLINKOUT:.*]].bc
