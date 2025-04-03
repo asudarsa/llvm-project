@@ -22,6 +22,8 @@
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Linker/Linker.h"
@@ -50,6 +52,9 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/Utils/SYCLSplitModule.h"
+#include "llvm/Transforms/Utils/SYCLUtils.h"
 
 using namespace llvm;
 using namespace llvm::opt;
@@ -77,8 +82,13 @@ static void printVersion(raw_ostream &OS) {
 /// The value of `argv[0]` when run.
 static const char *Executable;
 
+/// Mutex lock to protect writes to shared TempFiles in parallel.
+static std::mutex TempFilesMutex;
+
 /// Temporary files to be cleaned up.
 static SmallVector<SmallString<128>> TempFiles;
+
+using OffloadingImage = OffloadBinary::OffloadingImage;
 
 namespace {
 // Must not overlap with llvm::opt::DriverFlag.
@@ -141,6 +151,59 @@ Expected<StringRef> createTempFile(const ArgList &Args, const Twine &Prefix,
 
   TempFiles.emplace_back(std::move(OutputFile));
   return TempFiles.back();
+}
+
+/// Get a temporary filename suitable for output.
+Expected<StringRef> createOutputFile(const Twine &Prefix, StringRef Extension) {
+  std::scoped_lock<decltype(TempFilesMutex)> Lock(TempFilesMutex);
+  SmallString<128> OutputFile;
+  if (SaveTemps) {
+    (Prefix + "." + Extension).toNullTerminatedStringRef(OutputFile);
+  } else {
+    if (std::error_code EC =
+            sys::fs::createTemporaryFile(Prefix, Extension, OutputFile))
+      return createFileError(OutputFile, EC);
+  }
+
+  TempFiles.emplace_back(std::move(OutputFile));
+  return TempFiles.back();
+}
+
+Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
+  const OffloadBinary &Binary = *File.getBinary();
+
+  StringRef Prefix =
+      sys::path::stem(Binary.getMemoryBufferRef().getBufferIdentifier());
+  SmallString<128> Filename;
+  (Prefix + "-" + Binary.getTriple() + "-" + Binary.getArch())
+      .toVector(Filename);
+  llvm::replace(Filename, ':', '-');
+  auto TempFileOrErr = createOutputFile(Filename, "o");
+  if (!TempFileOrErr)
+    return TempFileOrErr.takeError();
+
+  Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
+      FileOutputBuffer::create(*TempFileOrErr, Binary.getImage().size());
+  if (!OutputOrErr)
+    return OutputOrErr.takeError();
+  std::unique_ptr<FileOutputBuffer> Output = std::move(*OutputOrErr);
+  llvm::copy(Binary.getImage(), Output->getBufferStart());
+  if (Error E = Output->commit())
+    return std::move(E);
+
+  return *TempFileOrErr;
+}
+
+static Error writeFile(StringRef Filename, StringRef Data) {
+  Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
+      FileOutputBuffer::create(Filename, Data.size());
+  if (!OutputOrErr)
+    return OutputOrErr.takeError();
+  std::unique_ptr<FileOutputBuffer> Output = std::move(*OutputOrErr);
+  llvm::copy(Data, Output->getBufferStart());
+  if (Error E = Output->commit())
+    return E;
+  return Error::success();
 }
 
 Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
@@ -274,12 +337,79 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
   return *BitcodeOutput;
 }
 
+void cleanupModule(Module &M) {
+  ModuleAnalysisManager MAM;
+  MAM.registerPass([&] { return PassInstrumentationAnalysis(); });
+  ModulePassManager MPM;
+  MPM.addPass(GlobalDCEPass()); // Delete unreachable globals.
+  MPM.run(M, MAM);
+}
+
+void writeModuleToFile(const Module &M, StringRef Path, bool OutputAssembly) {
+  int FD = -1;
+  if (std::error_code EC = sys::fs::openFileForWrite(Path, FD)) {
+    errs() << formatv("error opening file: {0}, error: {1}", Path, EC.message())
+           << '\n';
+    exit(1);
+  }
+
+  raw_fd_ostream OS(FD, /*ShouldClose*/ true);
+  if (OutputAssembly)
+    M.print(OS, /*AssemblyAnnotationWriter*/ nullptr);
+  else
+    WriteBitcodeToFile(M, OS);
+}
+
+Expected<SmallVector<ModuleAndSYCLMetadata>> runSYCLSplitModule(std::unique_ptr<Module> M, const ArgList &Args) {
+  SmallVector<ModuleAndSYCLMetadata> SplitModules;
+  if (Error Err = M->materializeAll())
+    return std::move(Err);
+  auto PostSYCLSplitCallback = [&](std::unique_ptr<Module> MPart,
+                                   std::string Symbols) {
+    if (verifyModule(*MPart)) {
+      errs() << "Broken Module!\n";
+      exit(1);
+    }
+    if (Error Err = MPart->materializeAll()) {
+      errs() << "Broken Module!\n";
+      exit(1);
+    }
+    // TODO: DCE is a crucial pass in a SYCL post-link pipeline.
+    //       At the moment, LIT checking can't be perfomed without DCE.
+    cleanupModule(*MPart);
+    size_t ID = SplitModules.size();
+    StringRef ModuleSuffix = ".bc";
+    std::string ModulePath =
+        (Twine(OutputFile) + "_post_link_" + Twine(ID) + ModuleSuffix).str();
+    writeModuleToFile(*MPart, ModulePath, /* OutputAssembly */ false);
+    SplitModules.emplace_back(std::move(ModulePath), std::move(Symbols));
+  };
+
+  StringRef Mode = Args.getLastArgValue(OPT_sycl_split_mode_EQ);
+  auto SYCLSplitMode = StringSwitch<IRSplitMode>(Mode)
+  .Case("per_source", IRSplitMode::IRSM_PER_TU)
+  .Case("per_kernel", IRSplitMode::IRSM_PER_KERNEL)
+  .Case("none", IRSplitMode::IRSM_NONE)
+  .Default(IRSplitMode::IRSM_NONE);
+  SYCLSplitModule(std::move(M), SYCLSplitMode, PostSYCLSplitCallback);
+
+  if (Verbose) {
+    std::string OutputFiles;
+    for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
+      OutputFiles.append(SplitModules[I].ModuleFilePath);
+      OutputFiles.append("\n");
+    }
+    errs() << formatv("sycl-module-split: outputs:\n{0}\n", OutputFiles); 
+  }
+  return SplitModules;
+}
+
 /// Run LLVM to SPIR-V translation.
 /// Converts 'File' from LLVM bitcode to SPIR-V format using SPIR-V backend.
 /// 'Args' encompasses all arguments required for linking device code and will
 /// be parsed to generate options required to be passed into the backend.
-static Expected<StringRef> runSPIRVCodeGen(StringRef File, const ArgList &Args,
-                                           LLVMContext &C) {
+static Error runSPIRVCodeGen(StringRef File, const ArgList &Args,
+                                           StringRef SPVFile, LLVMContext &C) {
   llvm::TimeTraceScope TimeScope("SPIR-V code generation");
 
   // Parse input module.
@@ -288,6 +418,9 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File, const ArgList &Args,
   if (!M)
     return createStringError(Err.getMessage());
 
+  if (Error Err = M->materializeAll())
+    return std::move(Err);
+                                        
   Triple TargetTriple(Args.getLastArgValue(OPT_triple_EQ));
   M->setTargetTriple(TargetTriple);
 
@@ -313,7 +446,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File, const ArgList &Args,
 
   // Open output file for writing.
   int FD = -1;
-  if (std::error_code EC = sys::fs::openFileForWrite(OutputFile, FD))
+  if (std::error_code EC = sys::fs::openFileForWrite(SPVFile, FD))
     return errorCodeToError(EC);
   auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
 
@@ -328,9 +461,9 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File, const ArgList &Args,
 
   if (Verbose)
     errs() << formatv("SPIR-V Backend: input: {0}, output: {1}\n", File,
-                      OutputFile);
+                      SPVFile);
 
-  return OutputFile;
+  return Error::success();
 }
 
 /// Performs the following steps:
@@ -339,6 +472,7 @@ static Expected<StringRef> runSPIRVCodeGen(StringRef File, const ArgList &Args,
 Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCL device linking");
 
+  std::mutex ImageMtx;
   LLVMContext C;
 
   // Link all input bitcode files and SYCL device library files, if any.
@@ -346,10 +480,77 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   if (!LinkedFile)
     reportError(LinkedFile.takeError());
 
+  auto LinkedModule = getBitcodeModule(*LinkedFile, C);
+  if (!LinkedModule)
+    return LinkedModule.takeError();
+  // sycl-post-link step
+  auto SplitModules = runSYCLSplitModule(std::move(*LinkedModule), Args);
+  if (!SplitModules)
+    reportError(SplitModules.takeError());
+
   // SPIR-V code generation step.
-  auto SPVFile = runSPIRVCodeGen(*LinkedFile, Args, C);
-  if (!SPVFile)
-    return SPVFile.takeError();
+  for (size_t I = 0, E = (*SplitModules).size(); I != E; ++I) {
+    std::string SPVFile(OutputFile);
+    SPVFile.append(utostr(I));
+    auto Err = runSPIRVCodeGen((*SplitModules)[I].ModuleFilePath, Args, SPVFile, C);
+    if (Err)
+      return std::move(Err);
+    (*SplitModules)[I].ModuleFilePath = SPVFile;
+  }
+
+  SmallVector<char, 1024> BinaryData;
+  raw_svector_ostream OS(BinaryData);
+  for (size_t I = 0, E = (*SplitModules).size(); I != E; ++I) {
+    auto File = (*SplitModules)[I].ModuleFilePath;
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
+        llvm::MemoryBuffer::getFileOrSTDIN(File);
+    if (std::error_code EC = FileOrErr.getError()) {
+      if (DryRun)
+        FileOrErr = MemoryBuffer::getMemBuffer("");
+      else
+        return createFileError(File, EC);
+    }
+
+    std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
+    OffloadingImage TheImage{};
+    TheImage.TheImageKind = IMG_Object;
+    TheImage.TheOffloadKind = OFK_SYCL;
+    TheImage.StringData["triple"] =
+        Args.MakeArgString(Args.getLastArgValue(OPT_triple_EQ));
+    TheImage.StringData["arch"] =
+        Args.MakeArgString(Args.getLastArgValue(OPT_arch_EQ));
+    TheImage.Image = std::move(*FileOrErr);
+
+    llvm::SmallString<0> Buffer = OffloadBinary::write(TheImage);
+    if (Buffer.size() % OffloadBinary::getAlignment() != 0)
+      return createStringError(inconvertibleErrorCode(),
+                                "Offload binary has invalid size alignment");
+    OS << Buffer;
+  }
+  if (Error E = writeFile(OutputFile,
+    StringRef(BinaryData.begin(), BinaryData.size())))
+    return E;
+ 
+  {
+    ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
+      MemoryBuffer::getFileOrSTDIN(OutputFile);
+    if (std::error_code EC = BufferOrErr.getError())
+      return createFileError(OutputFile, EC);
+
+    MemoryBufferRef Buffer = **BufferOrErr;
+    SmallVector<OffloadFile> Binaries;
+    if (Error Err = extractOffloadBinaries(Buffer, Binaries))
+      return std::move(Err);
+
+    unsigned I = 1;
+    for (auto &OffloadFile : Binaries) {
+      auto FileNameOrErr = writeOffloadFile(OffloadFile);
+      if (!FileNameOrErr)
+        return FileNameOrErr.takeError();
+      llvm::errs() << I++ << ". " << *FileNameOrErr << "\n";
+    }
+  }
+
   return Error::success();
 }
 

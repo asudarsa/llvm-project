@@ -35,6 +35,7 @@ enum OffloadKind : uint16_t {
   OFK_OpenMP,
   OFK_Cuda,
   OFK_HIP,
+  OFK_SYCL,
   OFK_LAST,
 };
 
@@ -46,6 +47,7 @@ enum ImageKind : uint16_t {
   IMG_Cubin,
   IMG_Fatbinary,
   IMG_PTX,
+  IMG_SPV,
   IMG_LAST,
 };
 
