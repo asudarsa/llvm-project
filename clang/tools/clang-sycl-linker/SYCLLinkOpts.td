@@ -39,6 +39,9 @@ def save_temps : Flag<["--", "-"], "save-temps">,
 def dry_run : Flag<["--", "-"], "dry-run">, Flags<[LinkerOnlyOption]>,
   HelpText<"Print generated commands without running.">;
 
+def sycl_split_mode_EQ : Joined<["--", "-"], "sycl-split-mode=">,
+  HelpText<"Mode of splitting performed by SYCL splitting algorithm. Options are 'per_source', 'per_kernel' and 'none'.">;
+
 def spirv_dump_device_code_EQ : Joined<["--", "-"], "spirv-dump-device-code=">,
   Flags<[LinkerOnlyOption]>,
   HelpText<"Path to the folder where the tool dumps SPIR-V device code. Other formats aren't dumped.">;
