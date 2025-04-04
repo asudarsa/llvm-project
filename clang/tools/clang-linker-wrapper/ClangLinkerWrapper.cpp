@@ -464,7 +464,8 @@ fatbinary(ArrayRef<std::pair<StringRef, StringRef>> InputFiles,
 } // namespace amdgcn
 
 namespace generic {
-Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
+Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
+                          bool HasSYCLOffloadKind = false) {
   llvm::TimeTraceScope TimeScope("Clang");
   // Use `clang` to invoke the appropriate device tools.
   Expected<std::string> ClangPath =
@@ -554,6 +555,14 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
   if (Args.hasArg(OPT_embed_bitcode))
     CmdArgs.push_back("-Wl,--lto-emit-llvm");
 
+  if (HasSYCLOffloadKind) {
+    CmdArgs.push_back("-fsycl");
+    CmdArgs.push_back("--sycl-link");
+    CmdArgs.append(
+        {"-Xlinker", Args.MakeArgString("-triple=" + Triple.getTriple())});
+    CmdArgs.append({"-Xlinker", Args.MakeArgString("-arch=" + Arch)});
+  }
+
   for (StringRef Arg : Args.getAllArgValues(OPT_linker_arg_EQ))
     CmdArgs.append({"-Xlinker", Args.MakeArgString(Arg)});
   for (StringRef Arg : Args.getAllArgValues(OPT_compiler_arg_EQ))
@@ -567,7 +576,8 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
 } // namespace generic
 
 Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
-                               const ArgList &Args) {
+                               const ArgList &Args,
+                               bool HasSYCLOffloadKind = false) {
   const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
   switch (Triple.getArch()) {
   case Triple::nvptx:
@@ -582,7 +592,7 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
   case Triple::spirv64:
   case Triple::systemz:
   case Triple::loongarch64:
-    return generic::clang(InputFiles, Args);
+    return generic::clang(InputFiles, Args, HasSYCLOffloadKind);
   default:
     return createStringError(Triple.getArchName() +
                              " linking is not supported");
@@ -924,9 +934,20 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
     auto LinkerArgs = getLinkerArgs(Input, BaseArgs);
 
     DenseSet<OffloadKind> ActiveOffloadKinds;
-    for (const auto &File : Input)
+    // Currently, SYCL device code linking process differs from generic device
+    // code linking.
+    // TODO: Remove check for offload kind, once SYCL device code linking is
+    // aligned with generic linking.
+    bool HasSYCLOffloadKind = false;
+    bool HasNonSYCLOffloadKind = false;
+    for (const auto &File : Input) {
       if (File.getBinary()->getOffloadKind() != OFK_None)
         ActiveOffloadKinds.insert(File.getBinary()->getOffloadKind());
+      if (File.getBinary()->getOffloadKind() == OFK_SYCL)
+        HasSYCLOffloadKind = true;
+      else
+        HasNonSYCLOffloadKind = true;
+    }
 
     // Write any remaining device inputs to an output file.
     SmallVector<StringRef> InputFiles;
@@ -937,38 +958,69 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
       InputFiles.emplace_back(*FileNameOrErr);
     }
 
-    // Link the remaining device files using the device linker.
-    auto OutputOrErr = linkDevice(InputFiles, LinkerArgs);
-    if (!OutputOrErr)
-      return OutputOrErr.takeError();
+    if (HasSYCLOffloadKind) {
+      // Link the remaining device files using the device linker.
+      auto OutputOrErr = linkDevice(InputFiles, LinkerArgs, HasSYCLOffloadKind);
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
+      // Output is a packaged object of device images. Unpackage the images and
+      // copy them to Images[Kind]
+      ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
+          MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
+      if (std::error_code EC = BufferOrErr.getError())
+        return createFileError(*OutputOrErr, EC);
 
-    // Store the offloading image for each linked output file.
-    for (OffloadKind Kind : ActiveOffloadKinds) {
-      llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
-          llvm::MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
-      if (std::error_code EC = FileOrErr.getError()) {
-        if (DryRun)
-          FileOrErr = MemoryBuffer::getMemBuffer("");
-        else
-          return createFileError(*OutputOrErr, EC);
+      MemoryBufferRef Buffer = **BufferOrErr;
+      SmallVector<OffloadFile> Binaries;
+      if (Error Err = extractOffloadBinaries(Buffer, Binaries))
+        return std::move(Err);
+      for (auto &OffloadFile : Binaries) {
+        auto TheBinary = OffloadFile.getBinary();
+        OffloadingImage TheImage{};
+        TheImage.TheImageKind = TheBinary->getImageKind();
+        TheImage.TheOffloadKind = TheBinary->getOffloadKind();
+        TheImage.StringData["triple"] = TheBinary->getTriple();
+        TheImage.StringData["arch"] = TheBinary->getArch();
+        TheImage.Image = MemoryBuffer::getMemBufferCopy(TheBinary->getImage());
+        Images[OFK_SYCL].emplace_back(std::move(TheImage));
       }
+    }
+    if (HasNonSYCLOffloadKind) {
+      // Link the remaining device files using the device linker.
+      auto OutputOrErr = linkDevice(InputFiles, LinkerArgs);
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
 
-      // Manually containerize offloading images not in ELF format.
-      if (Error E = containerizeRawImage(*FileOrErr, Kind, LinkerArgs))
-        return E;
+      // Store the offloading image for each linked output file.
+      for (OffloadKind Kind : ActiveOffloadKinds) {
+        if (Kind == OFK_SYCL)
+          continue;
+        llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
+            llvm::MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
+        if (std::error_code EC = FileOrErr.getError()) {
+          if (DryRun)
+            FileOrErr = MemoryBuffer::getMemBuffer("");
+          else
+            return createFileError(*OutputOrErr, EC);
+        }
 
-      std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
-      OffloadingImage TheImage{};
-      TheImage.TheImageKind =
-          Args.hasArg(OPT_embed_bitcode) ? IMG_Bitcode : IMG_Object;
-      TheImage.TheOffloadKind = Kind;
-      TheImage.StringData["triple"] =
-          Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_triple_EQ));
-      TheImage.StringData["arch"] =
-          Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_arch_EQ));
-      TheImage.Image = std::move(*FileOrErr);
+        // Manually containerize offloading images not in ELF format.
+        if (Error E = containerizeRawImage(*FileOrErr, Kind, LinkerArgs))
+          return E;
 
-      Images[Kind].emplace_back(std::move(TheImage));
+        std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
+        OffloadingImage TheImage{};
+        TheImage.TheImageKind =
+            Args.hasArg(OPT_embed_bitcode) ? IMG_Bitcode : IMG_Object;
+        TheImage.TheOffloadKind = Kind;
+        TheImage.StringData["triple"] =
+            Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_triple_EQ));
+        TheImage.StringData["arch"] =
+            Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_arch_EQ));
+        TheImage.Image = std::move(*FileOrErr);
+
+        Images[Kind].emplace_back(std::move(TheImage));
+      }
     }
     return Error::success();
   });
@@ -986,13 +1038,18 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
              A.StringData["arch"] > B.StringData["arch"] ||
              A.TheOffloadKind < B.TheOffloadKind;
     });
-    auto BundledImagesOrErr = bundleLinkedOutput(Input, Args, Kind);
-    if (!BundledImagesOrErr)
-      return BundledImagesOrErr.takeError();
-    auto OutputOrErr = wrapDeviceImages(*BundledImagesOrErr, Args, Kind);
-    if (!OutputOrErr)
-      return OutputOrErr.takeError();
-    WrappedOutput.push_back(*OutputOrErr);
+    if (Kind == OFK_SYCL) {
+      /* Do SYCL specific stuff */
+      WrappedOutput.push_back("dummy");
+    } else {
+      auto BundledImagesOrErr = bundleLinkedOutput(Input, Args, Kind);
+      if (!BundledImagesOrErr)
+        return BundledImagesOrErr.takeError();
+      auto OutputOrErr = wrapDeviceImages(*BundledImagesOrErr, Args, Kind);
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
+      WrappedOutput.push_back(*OutputOrErr);
+    }
   }
 
   return WrappedOutput;
