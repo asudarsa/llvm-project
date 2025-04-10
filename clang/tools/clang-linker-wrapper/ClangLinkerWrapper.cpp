@@ -556,7 +556,6 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
     CmdArgs.push_back("-Wl,--lto-emit-llvm");
 
   if (HasSYCLOffloadKind) {
-    CmdArgs.push_back("-fsycl");
     CmdArgs.push_back("--sycl-link");
     CmdArgs.append(
         {"-Xlinker", Args.MakeArgString("-triple=" + Triple.getTriple())});
@@ -958,6 +957,8 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
       InputFiles.emplace_back(*FileNameOrErr);
     }
 
+    // TODO: SYCL device code linking is currently not aligned with the generic
+    // device code linking. Alignment will be attempted in a future PR.
     if (HasSYCLOffloadKind) {
       // Link the remaining device files using the device linker.
       auto OutputOrErr = linkDevice(InputFiles, LinkerArgs, HasSYCLOffloadKind);
@@ -993,6 +994,7 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
 
       // Store the offloading image for each linked output file.
       for (OffloadKind Kind : ActiveOffloadKinds) {
+        // For SYCL, Offloading images were created inside clang-sycl-linker
         if (Kind == OFK_SYCL)
           continue;
         llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
@@ -1039,17 +1041,17 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
              A.TheOffloadKind < B.TheOffloadKind;
     });
     if (Kind == OFK_SYCL) {
-      /* Do SYCL specific stuff */
-      WrappedOutput.push_back("dummy");
-    } else {
-      auto BundledImagesOrErr = bundleLinkedOutput(Input, Args, Kind);
-      if (!BundledImagesOrErr)
-        return BundledImagesOrErr.takeError();
-      auto OutputOrErr = wrapDeviceImages(*BundledImagesOrErr, Args, Kind);
-      if (!OutputOrErr)
-        return OutputOrErr.takeError();
-      WrappedOutput.push_back(*OutputOrErr);
+      // TODO: Update once SYCL offload wrapping logic is available.
+      reportError(
+          createStringError("SYCL offload wrapping logic is not available"));
     }
+    auto BundledImagesOrErr = bundleLinkedOutput(Input, Args, Kind);
+    if (!BundledImagesOrErr)
+      return BundledImagesOrErr.takeError();
+    auto OutputOrErr = wrapDeviceImages(*BundledImagesOrErr, Args, Kind);
+    if (!OutputOrErr)
+      return OutputOrErr.takeError();
+    WrappedOutput.push_back(*OutputOrErr);
   }
 
   return WrappedOutput;
