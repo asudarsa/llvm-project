@@ -957,8 +957,6 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
       InputFiles.emplace_back(*FileNameOrErr);
     }
 
-    // TODO: SYCL device code linking is currently not aligned with the generic
-    // device code linking. Alignment will be attempted in a future PR.
     if (HasSYCLOffloadKind) {
       // Link the remaining device files using the device linker.
       auto OutputOrErr = linkDevice(InputFiles, LinkerArgs, HasSYCLOffloadKind);
@@ -986,43 +984,45 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
         Images[OFK_SYCL].emplace_back(std::move(TheImage));
       }
     }
-    if (HasNonSYCLOffloadKind) {
-      // Link the remaining device files using the device linker.
-      auto OutputOrErr = linkDevice(InputFiles, LinkerArgs);
-      if (!OutputOrErr)
-        return OutputOrErr.takeError();
 
-      // Store the offloading image for each linked output file.
-      for (OffloadKind Kind : ActiveOffloadKinds) {
-        // For SYCL, Offloading images were created inside clang-sycl-linker
-        if (Kind == OFK_SYCL)
-          continue;
-        llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
-            llvm::MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
-        if (std::error_code EC = FileOrErr.getError()) {
-          if (DryRun)
-            FileOrErr = MemoryBuffer::getMemBuffer("");
-          else
-            return createFileError(*OutputOrErr, EC);
-        }
+    if (!HasNonSYCLOffloadKind)
+      return Error::success();
 
-        // Manually containerize offloading images not in ELF format.
-        if (Error E = containerizeRawImage(*FileOrErr, Kind, LinkerArgs))
-          return E;
+    // Link the remaining device files using the device linker.
+    auto OutputOrErr = linkDevice(InputFiles, LinkerArgs);
+    if (!OutputOrErr)
+      return OutputOrErr.takeError();
 
-        std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
-        OffloadingImage TheImage{};
-        TheImage.TheImageKind =
-            Args.hasArg(OPT_embed_bitcode) ? IMG_Bitcode : IMG_Object;
-        TheImage.TheOffloadKind = Kind;
-        TheImage.StringData["triple"] =
-            Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_triple_EQ));
-        TheImage.StringData["arch"] =
-            Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_arch_EQ));
-        TheImage.Image = std::move(*FileOrErr);
-
-        Images[Kind].emplace_back(std::move(TheImage));
+    // Store the offloading image for each linked output file.
+    for (OffloadKind Kind : ActiveOffloadKinds) {
+      // For SYCL, Offloading images were created inside clang-sycl-linker
+      if (Kind == OFK_SYCL)
+        continue;
+      llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
+          llvm::MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
+      if (std::error_code EC = FileOrErr.getError()) {
+        if (DryRun)
+          FileOrErr = MemoryBuffer::getMemBuffer("");
+        else
+          return createFileError(*OutputOrErr, EC);
       }
+
+      // Manually containerize offloading images not in ELF format.
+      if (Error E = containerizeRawImage(*FileOrErr, Kind, LinkerArgs))
+        return E;
+
+      std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
+      OffloadingImage TheImage{};
+      TheImage.TheImageKind =
+          Args.hasArg(OPT_embed_bitcode) ? IMG_Bitcode : IMG_Object;
+      TheImage.TheOffloadKind = Kind;
+      TheImage.StringData["triple"] =
+          Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_triple_EQ));
+      TheImage.StringData["arch"] =
+          Args.MakeArgString(LinkerArgs.getLastArgValue(OPT_arch_EQ));
+      TheImage.Image = std::move(*FileOrErr);
+
+      Images[Kind].emplace_back(std::move(TheImage));
     }
     return Error::success();
   });
