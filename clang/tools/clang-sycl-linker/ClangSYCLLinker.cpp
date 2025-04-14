@@ -170,10 +170,10 @@ Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
 /// are LLVM IR bitcode files.
 // TODO: Support SPIR-V IR files.
 Expected<std::unique_ptr<Module>> getBitcodeModule(StringRef File,
-                                                   LLVMContext &C) {
+                                                   LLVMContext &Ctx) {
   SMDiagnostic Err;
 
-  auto M = getLazyIRFileModule(File, Err, C);
+  auto M = getLazyIRFileModule(File, Err, Ctx);
   if (M)
     return std::move(M);
   return createStringError(Err.getMessage());
@@ -213,16 +213,16 @@ Expected<SmallVector<std::string>> getSYCLDeviceLibs(const ArgList &Args) {
 /// 3. Link all the images gathered in Step 2 with the output of Step 1 using
 /// linkInModule API. LinkOnlyNeeded flag is used.
 Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
-                                   const ArgList &Args, LLVMContext &C) {
+                                   const ArgList &Args, LLVMContext &Ctx) {
   llvm::TimeTraceScope TimeScope("SYCL link device code");
 
   assert(InputFiles.size() && "No inputs to link");
 
-  auto LinkerOutput = std::make_unique<Module>("sycl-device-link", C);
+  auto LinkerOutput = std::make_unique<Module>("sycl-device-link", Ctx);
   Linker L(*LinkerOutput);
   // Link SYCL device input files.
   for (auto &File : InputFiles) {
-    auto ModOrErr = getBitcodeModule(File, C);
+    auto ModOrErr = getBitcodeModule(File, Ctx);
     if (!ModOrErr)
       return ModOrErr.takeError();
     if (L.linkInModule(std::move(*ModOrErr)))
@@ -237,7 +237,7 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
   // Link in SYCL device library files.
   const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
   for (auto &File : *SYCLDeviceLibFiles) {
-    auto LibMod = getBitcodeModule(File, C);
+    auto LibMod = getBitcodeModule(File, Ctx);
     if (!LibMod)
       return LibMod.takeError();
     if ((*LibMod)->getTargetTriple() == Triple) {
@@ -281,12 +281,12 @@ Expected<StringRef> linkDeviceCode(ArrayRef<std::string> InputFiles,
 /// 'Args' encompasses all arguments required for linking device code and will
 /// be parsed to generate options required to be passed into the backend.
 static Error runSPIRVCodeGen(StringRef File, const ArgList &Args,
-                             StringRef SPVFile, LLVMContext &C) {
+                             StringRef OutputFile, LLVMContext &Ctx) {
   llvm::TimeTraceScope TimeScope("SPIR-V code generation");
 
   // Parse input module.
   SMDiagnostic E;
-  std::unique_ptr<Module> M = parseIRFile(File, E, C);
+  std::unique_ptr<Module> M = parseIRFile(File, E, Ctx);
   if (!M)
     return createStringError(E.getMessage());
 
@@ -318,7 +318,7 @@ static Error runSPIRVCodeGen(StringRef File, const ArgList &Args,
 
   // Open output file for writing.
   int FD = -1;
-  if (std::error_code EC = sys::fs::openFileForWrite(SPVFile, FD))
+  if (std::error_code EC = sys::fs::openFileForWrite(OutputFile, FD))
     return errorCodeToError(EC);
   auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
 
@@ -333,7 +333,7 @@ static Error runSPIRVCodeGen(StringRef File, const ArgList &Args,
 
   if (Verbose)
     errs() << formatv("SPIR-V Backend: input: {0}, output: {1}\n", File,
-                      SPVFile);
+                      OutputFile);
 
   return Error::success();
 }
@@ -344,10 +344,10 @@ static Error runSPIRVCodeGen(StringRef File, const ArgList &Args,
 Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCL device linking");
 
-  LLVMContext C;
+  LLVMContext Ctx;
 
   // Link all input bitcode files and SYCL device library files, if any.
-  auto LinkedFile = linkDeviceCode(Files, Args, C);
+  auto LinkedFile = linkDeviceCode(Files, Args, Ctx);
   if (!LinkedFile)
     reportError(LinkedFile.takeError());
 
@@ -360,9 +360,10 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
 
   // SPIR-V code generation step.
   for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
-    std::string SPVFile(OutputFile);
-    SPVFile.append(utostr(I));
-    auto Err = runSPIRVCodeGen(SplitModules[I], Args, SPVFile, C);
+    auto Stem = OutputFile.split('.').first;
+    std::string SPVFile(Stem);
+    SPVFile.append("_" + utostr(I) + ".spv");
+    auto Err = runSPIRVCodeGen(SplitModules[I], Args, SPVFile, Ctx);
     if (Err)
       return std::move(Err);
     SplitModules[I] = SPVFile;
