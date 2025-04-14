@@ -360,7 +360,7 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
 
   // SPIR-V code generation step.
   for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
-    auto Stem = OutputFile.split('.').first;
+    auto Stem = OutputFile.rsplit('.').first;
     std::string SPVFile(Stem);
     SPVFile.append("_" + utostr(I) + ".spv");
     auto Err = runSPIRVCodeGen(SplitModules[I], Args, SPVFile, Ctx);
@@ -373,7 +373,7 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   int FD = -1;
   if (std::error_code EC = sys::fs::openFileForWrite(OutputFile, FD))
     return errorCodeToError(EC);
-  llvm::raw_fd_ostream FS(FD, true);
+  llvm::raw_fd_ostream FS(FD, /*shouldClose=*/true);
 
   for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
     auto File = SplitModules[I];
@@ -401,6 +401,7 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
   }
   return Error::success();
 }
+
 } // namespace
 
 int main(int argc, char **argv) {
